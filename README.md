@@ -1,6 +1,6 @@
 # RocketGPU full-state suite
 
-121 Rocket League recordings with the game's full physics state, and the scripts that score
+144 Rocket League recordings with the game's full physics state, and the scripts that score
 [RocketGPU](https://github.com/thecosmicskye/RocketGPU) and RocketSim v3 against them.
 
 Each segment starts from the game's state at one tick and runs open loop for up to 120 ticks on the
@@ -13,14 +13,14 @@ game's recorded inputs. Each tick, every car and the ball are compared with the 
 
 ## Results
 
-12,038,088 body-ticks in 22,557 segments.
+14,678,660 body-ticks in 26,378 segments.
 
-| | RocketGPU (CUDA) | RocketSim v3 0.3.5 |
-|---|---|---|
-| Exact body-ticks | 100.0000% | 4.4884% |
-| Exact segments | 100.000% | 0.000% |
-| Segment pass | 100.000% | 85.930% |
-| Mean error k1 / k30 / k120 | 0 / 0 / 0 | 0.80 / 0.64 / 1.65 |
+| | RocketGPU (CUDA) | RocketGPU (CPU) | RocketSim v3 0.3.5 |
+|---|---|---|---|
+| Exact body-ticks | 100.0000% | 100.0000% | 4.4661% |
+| Exact segments | 100.000% | 100.000% | 0.000% |
+| Segment pass | 100.000% | 100.000% | 86.296% |
+| Mean error k1 / k30 / k120 | 0 / 0 / 0 | 0 / 0 / 0 | 0.81 / 0.63 / 1.57 |
 
 RocketGPU starts from the full state (bodies, broadphase, contact manifolds, timers). RocketSim v3
 starts from the public state (what its `CarState` and `BallState` hold).
@@ -30,17 +30,17 @@ starts from the public state (what its `CarState` and `BallState` hold).
 Recorded in Rocket League. The truth is the game's own state at each tick. Each segment's start state is the
 game's state at that tick in RocketGPU's state fields (the names `Arena.get_full_state()` uses), so it loads
 with `set_full_state` in
-[RocketGPU 73c3e9f7](https://github.com/thecosmicskye/RocketGPU/commit/73c3e9f72d24e79968611d52a9ed4837d30b23c4)
+[RocketGPU 15484501](https://github.com/thecosmicskye/RocketGPU/commit/15484501768d0a537eed853e3287f0d93ea1b417)
 or later builds with the same fields.
 
-The recordings are a release asset (744 MB):
+The recordings are a release asset (863 MB):
 
 ```bash
-gh release download v1 -R thecosmicskye/RocketGPU-fullstate-suite
+gh release download v2 -R thecosmicskye/RocketGPU-fullstate-suite
 ```
 
 ```bash
-tar xf fullstate-suite-v1.tar && sha256sum -c data.sha256
+tar xf fullstate-suite-v2.tar && sha256sum -c data.sha256
 ```
 
 `data/NAME.npz` holds, per recording:
@@ -54,8 +54,8 @@ tar xf fullstate-suite-v1.tar && sha256sum -c data.sha256
 | `public` | per segment, the public start state (the rows `score_v3.py` sends) |
 
 `manifest.json` lists the recordings by split: `dev` and `test` (bot matches, 1v1 to 3v3), `bodies`
-(every car body), `body_psyclops`, `camp` and `scn` (scripted scenarios with state sets), `h1`
-(held out until the others were exact).
+(every car body), `body_psyclops`, `camp` and `scn` (scripted scenarios with state sets), `h1` and `h2`
+(held out until the others were exact), `uneven` (uneven teams, up to 8 cars) and `pads` (boost pad tests).
 
 ## Run
 
@@ -75,6 +75,8 @@ export PYTHONPATH=/path/to/RocketGPU/build/python ROCKETGPU_COLLISION_MESH_DIR=/
 ```bash
 python score.py data --jobs 4 --json rocketgpu.json
 ```
+
+`score_batch.py` takes the same arguments and writes the same JSON, stepping each recording's segments together.
 
 `--splits dev,test` scores some splits. `--shard I/N` scores every Nth recording (one process per
 GPU with `CUDA_VISIBLE_DEVICES`); `python score.py --merge all.json part*.json` adds the parts up.
