@@ -17,10 +17,10 @@ game's recorded inputs. Each tick, every car and the ball are compared with the 
 
 | | RocketGPU (CUDA) | RocketGPU (CPU) | RocketSim v3 0.3.5 |
 |---|---|---|---|
-| Exact body-ticks | pending | 100.0000% | 4.3193% |
-| Exact segments | pending | 100.000% | 0.000% |
-| Segment pass | pending | 100.000% | 86.154% |
-| Mean error k1 / k30 / k120 | pending | 0 / 0 / 0 | 0.80 / 0.65 / 1.63 |
+| Exact body-ticks | 100.0000% | 100.0000% | 4.3193% |
+| Exact segments | 100.000% | 100.000% | 0.000% |
+| Segment pass | 100.000% | 100.000% | 86.154% |
+| Mean error k1 / k30 / k120 | 0 / 0 / 0 | 0 / 0 / 0 | 0.80 / 0.65 / 1.63 |
 
 RocketGPU starts from the full state (bodies, broadphase, contact manifolds, timers). RocketSim v3
 starts from the public state (what its `CarState`, `BallState` and boost pad states hold).
