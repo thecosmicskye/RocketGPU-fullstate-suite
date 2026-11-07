@@ -13,6 +13,9 @@ recorded inputs. Every tick is compared with the game's state:
   segment pass   car-ticks whose normalized error (pos / 2 uu, vel / 3 uu/s, ang vel / 0.05 rad/s, forward and up
                  axes / 0.05, over the car and the ball) is below 1.
   mean error     that normalized error, capped at 10, at 1, 30 and 120 ticks.
+
+Recordings marked controls_only get nothing after the start state but each car's controls (see score_controls_only),
+and their segments also run through boost pad pickups and respawns; they get their own summary line.
 """
 import argparse
 import json
@@ -211,6 +214,8 @@ def score(path):
     rp, rs = build()
     z = np.load(path)
     meta = json.loads(z["meta"].tobytes())
+    if meta.get("controls_only"):
+        return score_controls_only(rp, rs, {k: z[k] for k in z.files}, meta)
     ncars = meta["ncars"]
     state = {k[2:]: z[k] for k in z.files if k.startswith("s.")}
     ctl, drv, frac, start_dt = z["ctl"], z["drv"], z["frac"], z["start_dt"]
@@ -255,6 +260,213 @@ def score(path):
             r["segs"] += 1
             r["exact_segs"] += seg_exact
     return r
+
+
+# ---- controls-only recordings ----
+#
+# A recording whose meta says "controls_only" holds each segment's start state and then only each car's controls. The
+# start state has the boost pads as the game's pad timers left them (pads on) and the start frame's interpolation
+# fraction, which stays fixed (steady 120 fps); the arena runs its own countdown, holds, pickups, demos and respawns.
+# Segments start at a tick whose frame and the frames after it ran one tick on time; one that hits a dropped-time frame,
+# starts with a car or the ball out of the world, or starts in a hold whose timer the game did not record is left out
+# (the meta's "ends" counts them). Event segments ("kind" pickup / padrespawn / demo) run through those events.
+# Per tick the file holds, in the game's car slot order (a segment's "perm" maps the arena's cars to slots): the
+# controls, the bodies ("truth") and which are in the world ("present"), each pad's taken flag after the tick ("pads",
+# arena pad order "pad_state_index") and each car's boost after it ("boost"); "held" ticks are not scored.
+
+EV = ("same", "early", "late", "missing", "extra")
+
+
+def new_result(name, controls_only=False):
+    r = dict(name=name, passed=0, total=0, at_k={str(k): [] for k in KS}, exact_bt=0, body_ticks=0, exact_segs=0,
+             segs=0, first=[])
+    if controls_only:
+        r["controls_only"] = dict(
+            pickup=dict.fromkeys(EV, 0), pad_respawn=dict.fromkeys(EV, 0), demo=dict.fromkeys(EV, 0),
+            respawn=dict.fromkeys(EV, 0), pickup_car_ok=0, pickup_car_scored=0, respawn_body_exact=0, respawn_scored=0,
+            presence_mismatch=0, kinds={})
+    return r
+
+
+def add_result(r, a):
+    """Add a segment's tallies (a) to the recording's (r), in segment order."""
+    for k, v in a.items():
+        if k == "first":
+            r[k] += v[:5 - len(r[k])]
+        elif k == "at_k":
+            for kk, x in v.items():
+                r[k][kk] += x
+        elif k == "controls_only":
+            add_result(r[k], v)
+        elif isinstance(v, dict):
+            d = r.setdefault(k, {})
+            for kk, x in v.items():
+                d[kk] = [p + q for p, q in zip(d.get(kk, [0] * len(x)), x)] if isinstance(x, list) else d.get(kk, 0) + x
+        elif k != "name":
+            r[k] += v
+
+
+def match(game, sim, out, window):
+    """Event ticks of one series, the game's against the sim's: same tick, or the nearest within the window."""
+    sim = list(sim)
+    for g in game:
+        if g in sim:
+            out["same"] += 1
+            sim.remove(g)
+            continue
+        near = [s for s in sim if abs(s - g) <= window]
+        if near:
+            s = min(near, key=lambda s: abs(s - g))
+            out["early" if s < g else "late"] += 1
+            sim.remove(s)
+        else:
+            out["missing"] += 1
+    out["extra"] += len(sim)
+
+
+def edges(series, init):
+    """Ticks where a bool series (after each tick; init before the first) turns on and off."""
+    prev = np.r_[init, series[:-1]]
+    return np.flatnonzero(series & ~prev).tolist(), np.flatnonzero(~series & prev).tolist()
+
+
+def pads_taken(arena, psi):
+    st = arena.get_boost_pad_states()
+    return np.array([not st[p].is_active for p in psi], bool)
+
+
+def cars_live(arena, ncars):
+    """Each car in the world (not demolished), and its boost 0..1."""
+    st = State(arena)
+    return (np.array([not st.get("car_states.is_demoed", k, "<B")[0] for k in range(ncars)], bool),
+            np.array([st.get("car_states.boost", k, "<f")[0] / 100.0 for k in range(ncars)], np.float32))
+
+
+class Run:
+    """One controls-only segment's sim reads after each tick."""
+
+    def __init__(self, seg, at, ncars, npads, pads0, live0):
+        self.seg = seg
+        self.rows = [at[seg["start"] + k] for k in range(seg["ticks"])]
+        n = len(self.rows)
+        self.bodies = [None] * n
+        self.pads, self.live = np.zeros((n, npads), bool), np.zeros((n, ncars), bool)
+        self.boost = np.zeros((n, ncars), np.float32)
+        self.pads0, self.live0 = pads0, live0
+
+
+def controls_only_run(rp, rs, z, meta, n, at):
+    seg, ncars, psi = meta["segments"][n], meta["ncars"], z["pad_state_index"]
+    arena, cars = restore(rp, rs, seg, meta["cars"][seg["cars"]],
+                          {k[2:]: z[k][n].tobytes() for k in z if k.startswith("s.")})
+    run = Run(seg, at, ncars, len(psi), pads_taken(arena, psi), cars_live(arena, ncars)[0])
+    for k, i in enumerate(run.rows):
+        for j, c in enumerate(cars):
+            c.set_controls(controls(rs, z["ctl"][i, seg["perm"][j]]))
+        arena.step(1)
+        run.bodies[k] = read_bodies(arena, ncars)
+        run.pads[k] = pads_taken(arena, psi)
+        run.live[k], run.boost[k] = cars_live(arena, ncars)
+    return run
+
+
+def controls_only_tally(run, z, meta):
+    """A segment's tallies: score()'s, over the bodies the game or the sim has in the world, plus its pickups, pad
+    respawns, demos and respawns against the game's."""
+    seg, rows, ncars = run.seg, run.rows, meta["ncars"]
+    r = new_result(meta["name"], True)
+    h = r["controls_only"]
+    truth, present, held, boost = z["truth"], z["present"], z["held"], z["boost"]
+    P = list(seg["perm"]) + [ncars]
+    seg_exact, scored = True, False
+    for k, i in enumerate(rows):
+        if seg["spawn"] and k == 0 or held[i]:
+            continue
+        sim, tr = run.bodies[k], truth[i][P]
+        for j, e in enumerate(norms(sim, truth_rows(tr), ncars)):
+            if present[i, P[j]] and run.live[k, j]:
+                r["total"] += 1
+                r["passed"] += e < 1.0
+                if str(k + 1) in r["at_k"]:
+                    r["at_k"][str(k + 1)].append(min(e, 10.0))
+        for j in range(ncars + 1):
+            gp, sp = bool(present[i, P[j]]), j == ncars or bool(run.live[k, j])
+            if not gp and not sp:
+                continue
+            ok = gp and sp and exact(sim[j], tr[j])
+            h["presence_mismatch"] += gp != sp
+            r["body_ticks"] += 1
+            r["exact_bt"] += ok
+            scored = True
+            if not ok and seg_exact:
+                seg_exact = False
+                r["first"].append([seg["start"], k, "ball" if j == ncars else f"car{j}"])
+    if scored:
+        r["segs"] += 1
+        r["exact_segs"] += seg_exact
+    h["kinds"][seg["kind"]] = [int(scored), int(scored and seg_exact), r["body_ticks"], r["exact_bt"]]
+    n = len(rows)
+    gpads = z["pads"][rows]
+    for p in range(gpads.shape[1]):
+        g_on, g_off = edges(gpads[:, p], run.pads0[p])
+        s_on, s_off = edges(run.pads[:, p], run.pads0[p])
+        match(g_on, s_on, h["pickup"], n)
+        match(g_off, s_off, h["pad_respawn"], n)
+        for k in g_on:
+            if k and k in s_on:   # on the same tick: the same car got the boost
+                h["pickup_car_scored"] += 1
+                h["pickup_car_ok"] += int(np.argmax(boost[rows[k]] - boost[rows[k - 1]])) == \
+                    P[int(np.argmax(run.boost[k] - run.boost[k - 1]))]
+    k0 = 1 if seg["spawn"] else 0   # a spawn segment's first tick is the game re-creating the cars
+    for j in range(ncars):
+        g, s = present[rows, P[j]].astype(bool)[k0:], run.live[k0:, j]
+        g_in, g_out = edges(g, g[0] if k0 else run.live0[j])
+        s_in, s_out = edges(s, s[0] if k0 else run.live0[j])
+        match(g_out, s_out, h["demo"], n)
+        match(g_in, s_in, h["respawn"], n)
+        for k in g_in:
+            if k in s_in:
+                h["respawn_scored"] += 1
+                h["respawn_body_exact"] += exact(run.bodies[k + k0][j], truth[rows[k + k0]][P[j]])
+    return r
+
+
+def score_controls_only(rp, rs, z, meta):
+    at = {int(f): i for i, f in enumerate(z["frame"])}
+    r = new_result(meta["name"], True)
+    r["controls_only"]["ends"] = meta["ends"]
+    for n in range(len(meta["segments"])):
+        add_result(r, controls_only_tally(controls_only_run(rp, rs, z, meta, n, at), z, meta))
+    return r
+
+
+def controls_only_summary(res):
+    rs_ = [r for r in res if "controls_only" in r]
+    if not rs_:
+        return None
+    out = dict(recordings=len(rs_), segs=0, exact_segs=0, body_ticks=0, exact_bt=0)
+    h = new_result("", True)["controls_only"]
+    for r in rs_:
+        for k in out:
+            if k != "recordings":
+                out[k] += r[k]
+        add_result(h, r["controls_only"])
+    out.update(h)
+    return out
+
+
+def controls_only_report(d):
+    e = d["ends"]
+    drop = sum(v for k, v in e.items() if k not in ("kept", "hitch_ticks"))
+    other = drop - e.get("hitch", 0) - e.get("not_all_present", 0) - e.get("invalid", 0)
+    ev = lambda x: (f"{d[x]['same']}/{sum(d[x][k] for k in EV[:4])}" +
+                    (f" (+{d[x]['extra']} extra)" if d[x]["extra"] else ""))
+    print(f"[controls-only] {d['recordings']} recordings  segments kept {e.get('kept', 0)}, dropped {drop} "
+          f"(dropped-time frame {e.get('hitch', 0)}, missing at start {e.get('not_all_present', 0)}, "
+          f"invalid {e.get('invalid', 0)}, no start state {other})  exact body-ticks "
+          f"{100.0 * d['exact_bt'] / max(d['body_ticks'], 1):.4f}% of {d['body_ticks']}  segments "
+          f"{100.0 * d['exact_segs'] / max(d['segs'], 1):.3f}% of {d['segs']}  on the game's tick: "
+          f"pickups {ev('pickup')}, pad respawns {ev('pad_respawn')}, demos {ev('demo')}, respawns {ev('respawn')}")
 
 
 def summary(res, groups):
@@ -311,9 +523,12 @@ def main():
     groups["all"] = {r["name"] for r in res}
     out = summary(res, groups)
     report(out, res)
+    co = controls_only_summary(res)
+    if co:
+        controls_only_report(co)
     path = a.merge[0] if a.merge else a.json
     if path:
-        json.dump(dict(summary=out, recordings=res), open(path, "w"))
+        json.dump(dict(summary=out, controls_only=co, recordings=res), open(path, "w"))
 
 
 if __name__ == "__main__":

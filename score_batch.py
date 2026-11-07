@@ -80,6 +80,8 @@ def score(path):
     F = Fields(rp)
     z = np.load(path)
     meta = json.loads(z["meta"].tobytes())
+    if meta.get("controls_only"):
+        return score_controls_only(rp, F, rs, {k: z[k] for k in z.files}, meta)
     ncars = meta["ncars"]
     state = {k[2:]: z[k] for k in z.files if k.startswith("s.")}
     ctl, drv, frac, start_dt = z["ctl"], z["drv"], z["frac"], z["start_dt"]
@@ -274,6 +276,80 @@ def score(path):
         if acc[5]:
             r["segs"] += 1
             r["exact_segs"] += acc[6]
+    return r
+
+
+PAD_BYTES, PAD_ACTIVE = 16, 4   # a BoostPadState row: cooldown f32, then is_active
+
+
+def raw_bodies(cs, bs, F, e, cap, ncars):
+    """read_bodies() from a DevBatch's raw car and ball rows of env e."""
+    def v(row, field):
+        o = field[0]
+        return tuple(float(x) for x in row[o:o + 12].view("<f4"))
+
+    def body(row, f, vel, ang):
+        vel_uu = v(row, f[vel])
+        return dict(pos=v(row, f["pos_bt"]), vel=tuple(x / S.UU for x in vel_uu), vel_bt=v(row, f["vel_bt"]),
+                    vel_uu=vel_uu, ang=v(row, f[ang]), fwd=v(row, f["basis_forward"]), right=v(row, f["basis_right"]),
+                    up=v(row, f["basis_up"]))
+    return [body(cs[e * cap + j], F.c, "internal_vel", "internal_ang_vel") for j in range(ncars)] + \
+        [body(bs[e], F.b, "vel", "ang_vel")]
+
+
+def score_controls_only(rp, F, rs, z, meta):
+    """score.py's score_controls_only with a recording's segments stepped together as DevBatch envs: each env gets its
+    segment's restored start, then only controls. The start frame's fraction (each arena's mutator) goes in per env
+    through set_frame_frac, the same value every tick. Spawn segments run on score.py's path."""
+    ncars, psi, segs = meta["ncars"], z["pad_state_index"], meta["segments"]
+    at = {int(f): i for i, f in enumerate(z["frame"])}
+    state = {k[2:]: z[k] for k in z if k.startswith("s.")}
+    out = [None] * len(segs)
+    ns = [n for n, s in enumerate(segs) if not s["spawn"]]
+    dm_o, bo_o = F.c["is_demoed"][0], F.c["boost"][0]
+    for b0 in range(0, len(ns), BATCH_MAX):
+        batch = ns[b0:b0 + BATCH_MAX]
+        b, runs, fracs = None, [], []
+        for e, n in enumerate(batch):
+            seg = segs[n]
+            arena, _ = S.restore(rp, rs, seg, meta["cars"][seg["cars"]], {k: v[n].tobytes() for k, v in state.items()})
+            if b is None:
+                b = rp.compat.DevBatch(arena, len(batch))
+            b.set_env(e, arena)
+            runs.append(S.Run(seg, at, ncars, len(psi), S.pads_taken(arena, psi), S.cars_live(arena, ncars)[0]))
+            fracs.append(arena.get_mutator_config().boost_pad_frame_frac)
+        b.commit()
+        cap, N, npad = b.car_capacity, len(batch), b.pad_count
+        cb = np.zeros(N * cap, CTL)
+        for k in range(max(segs[n]["ticks"] for n in batch)):
+            live = [e for e, n in enumerate(batch) if k < segs[n]["ticks"]]
+            for e in live:
+                perm, i = segs[batch[e]]["perm"], runs[e].rows[k]
+                for j in range(ncars):
+                    x = S.controls(rs, z["ctl"][i, perm[j]])
+                    cb[e * cap + j] = ((x.throttle, x.steer, x.pitch, x.yaw, x.roll),
+                                       (bool(x.jump), bool(x.boost), bool(x.handbrake)), 0)
+            b.set_raw("controls", cb.tobytes())
+            b.set_frame_frac(fracs)
+            b.set_frame_start_dt([-1.0] * N)
+            b.step(1)
+            cs = np.frombuffer(bytearray(b.get_raw("car_states")), np.uint8).reshape(N * cap, F.car)
+            bs = np.frombuffer(bytearray(b.get_raw("ball_states")), np.uint8).reshape(N, F.ball)
+            pads = np.frombuffer(bytearray(b.get_raw("boost_pads")), np.uint8).reshape(N, npad, PAD_BYTES)
+            for e in live:
+                run, rows = runs[e], cs[e * cap:e * cap + ncars]
+                run.bodies[k] = raw_bodies(cs, bs, F, e, cap, ncars)
+                run.pads[k] = pads[e, psi, PAD_ACTIVE] == 0
+                run.live[k] = rows[:, dm_o] == 0
+                run.boost[k] = np.ascontiguousarray(rows[:, bo_o:bo_o + 4]).view("<f4")[:, 0] / 100.0
+        for e, n in enumerate(batch):
+            out[n] = S.controls_only_tally(runs[e], z, meta)
+    r = S.new_result(meta["name"], True)
+    r["controls_only"]["ends"] = meta["ends"]
+    for n in range(len(segs)):
+        if out[n] is None:
+            out[n] = S.controls_only_tally(S.controls_only_run(rp, rs, z, meta, n, at), z, meta)
+        S.add_result(r, out[n])
     return r
 
 

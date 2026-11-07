@@ -53,6 +53,14 @@ tar xf fullstate-suite-v2.tar && sha256sum -c data.sha256
 | `s.*`, `meta` | per segment, the full start state (`Arena.get_full_state()` fields), and the cars, boost pads and mutators |
 | `public` | per segment, the public start state (the rows `score_v3.py` sends) |
 
+The `uneven` and `pads` recordings ran one physics tick per frame and are marked `"controls_only": 1` in `meta`.
+Each segment gets its start state, boost pads included, and then only the cars' controls: no `drv`, `frac`,
+`start_dt` or credits. Their segments also run through boost pad pickups and respawns. Their per-tick
+arrays are in the game's car order (a segment's `perm` maps the arena's cars to it) and add `present`
+(which cars and the ball are in the world), `pads` (each pad taken after the tick) and `boost`. The
+scorers print a separate `[controls-only]` line for them: segments kept and dropped, and pickups, pad respawns,
+demos and respawns on the game's tick.
+
 `manifest.json` lists the recordings by split: `dev` and `test` (bot matches, 1v1 to 3v3), `bodies`
 (every car body), `body_psyclops`, `camp` and `scn` (scripted scenarios with state sets), `h1` and `h2`
 (held out until the others were exact), `uneven` (uneven teams, up to 8 cars) and `pads` (boost pad tests).
