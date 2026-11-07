@@ -13,17 +13,17 @@ game's recorded inputs. Each tick, every car and the ball are compared with the 
 
 ## Results
 
-14,678,660 body-ticks in 26,378 segments.
+13,930,650 body-ticks in 25,622 segments.
 
 | | RocketGPU (CUDA) | RocketGPU (CPU) | RocketSim v3 0.3.5 |
 |---|---|---|---|
-| Exact body-ticks | 100.0000% | 100.0000% | 4.4661% |
-| Exact segments | 100.000% | 100.000% | 0.000% |
-| Segment pass | 100.000% | 100.000% | 86.296% |
-| Mean error k1 / k30 / k120 | 0 / 0 / 0 | 0 / 0 / 0 | 0.81 / 0.63 / 1.57 |
+| Exact body-ticks | pending | 100.0000% | 4.3193% |
+| Exact segments | pending | 100.000% | 0.000% |
+| Segment pass | pending | 100.000% | 86.154% |
+| Mean error k1 / k30 / k120 | pending | 0 / 0 / 0 | 0.80 / 0.65 / 1.63 |
 
 RocketGPU starts from the full state (bodies, broadphase, contact manifolds, timers). RocketSim v3
-starts from the public state (what its `CarState` and `BallState` hold).
+starts from the public state (what its `CarState`, `BallState` and boost pad states hold).
 
 ## Data
 
@@ -33,14 +33,14 @@ with `set_full_state` in
 [RocketGPU 15484501](https://github.com/thecosmicskye/RocketGPU/commit/15484501768d0a537eed853e3287f0d93ea1b417)
 or later builds with the same fields.
 
-The recordings are a release asset (863 MB):
+The recordings are a release asset (878 MB):
 
 ```bash
-gh release download v2 -R thecosmicskye/RocketGPU-fullstate-suite
+gh release download v3 -R thecosmicskye/RocketGPU-fullstate-suite
 ```
 
 ```bash
-tar xf fullstate-suite-v2.tar && sha256sum -c data.sha256
+tar xf fullstate-suite-v3.tar && sha256sum -c data.sha256
 ```
 
 `data/NAME.npz` holds, per recording:
