@@ -4,7 +4,8 @@
 
 WORKER is the v3/ build (target/release/fs_v3); it needs ROCKETGPU_COLLISION_MESH_DIR. v3 takes no hidden state, so
 each segment starts from the public start state (the data's "public" rows: per car the preset, team and v3 CarState
-fields, then the ball, whether it sleeps, and the boost pads).
+fields, then the ball, whether it sleeps, and the boost pads). Recordings marked controls_only get the start row of that
+frame alone, the pads' cooldowns included (v3's pad setter takes whole ticks), and then only each car's controls.
 """
 import argparse
 import json
@@ -27,6 +28,8 @@ def run(args):
     path, worker = args
     z = np.load(path)
     meta = json.loads(z["meta"].tobytes())
+    if meta.get("controls_only"):
+        return run_controls_only({k: z[k] for k in z.files}, meta, worker)
     ncars = meta["ncars"]
     ctl, drv, held, truth, pub = z["ctl"], z["drv"], z["held"], z["truth"], z["public"]
     at = {int(f): i for i, f in enumerate(z["frame"])}
@@ -81,6 +84,62 @@ def run(args):
     return r
 
 
+def segment(w, ncars, start, ticks, rows):
+    """One segment through the worker: the bodies after each tick, as score.py reads them."""
+    msg = [ncars, len(rows)] + start + ticks
+    w.stdin.write(struct.pack("<%dd" % len(msg), *map(float, msg)))
+    w.stdin.flush()
+    nb = ncars + 1
+    out = np.frombuffer(w.stdout.read(4 * 18 * nb * len(rows)), F32).reshape(len(rows), nb, 18)
+    return [[dict(pos=o[0:3] / F32(50), vel=o[3:6] / F32(50), vel_bt=o[3:6] / F32(50), ang=o[6:9], fwd=o[9:12],
+                  right=o[12:15], up=o[15:18]) for o in out[k]] for k in range(len(rows))]
+
+
+def run_controls_only(z, meta, worker):
+    """score.py's score_controls_only for v3: the same segments and ticks, each car's controls only (driving, no
+    credits). Bodies count where the game has them in the world, in the game's car order (the segment's perm)."""
+    ncars = meta["ncars"]
+    ctl, held, truth, present, pub = z["ctl"], z["held"], z["truth"], z["present"], z["public"]
+    at = {int(f): i for i, f in enumerate(z["frame"])}
+    w = subprocess.Popen([worker], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    r = sc.new_result(meta["name"])
+    r["controls_only"] = True
+    for n, seg in enumerate(meta["segments"]):
+        P = list(seg["perm"]) + [ncars]
+        ticks, rows = [], []
+        for k in range(seg["ticks"]):
+            i = at[seg["start"] + k]
+            for j in range(ncars):
+                ticks += list(ctl[i, P[j]]) + [True, 0.0]
+            rows.append(None if seg["spawn"] and k == 0 or held[i] else i)
+        sims = segment(w, ncars, list(pub[n]), ticks, rows)
+        seg_exact, scored = True, False
+        for k, i in enumerate(rows):
+            if i is None:
+                continue
+            sim, tr, gp = sims[k], truth[i][P], present[i][P]
+            for j, e in enumerate(sc.norms(sim, sc.truth_rows(tr), ncars)):
+                if gp[j]:
+                    r["total"] += 1
+                    r["passed"] += e < 1.0
+                    if str(k + 1) in r["at_k"]:
+                        r["at_k"][str(k + 1)].append(min(e, 10.0))
+            for j in range(ncars + 1):
+                if gp[j]:
+                    ok = sc.exact(sim[j], tr[j])
+                    r["body_ticks"] += 1
+                    r["exact_bt"] += ok
+                    seg_exact = seg_exact and ok
+                    scored = True
+        if scored:
+            r["segs"] += 1
+            r["exact_segs"] += seg_exact
+    w.stdin.write(struct.pack("<d", -1.0))
+    w.stdin.close()
+    w.wait()
+    return r
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("data")
@@ -100,6 +159,9 @@ def main():
     print(f"{len(names)} recordings, {time.time() - t0:.0f} s")
     groups = {s: {r["name"] for r in res if split_of[r["name"]] == s} for s in splits}
     groups["all"] = set(names)
+    co = {r["name"] for r in res if r.get("controls_only")}
+    if co:
+        groups["controls-only"] = co
     out = sc.summary(res, groups)
     sc.report(out, [])
     if a.json:
