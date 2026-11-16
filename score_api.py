@@ -10,7 +10,8 @@ Replays the segments as score.py does and compares, per car and tick, with DATA_
           middle of a render frame are not scored).
   rlbot   rocketgpu/rlbotv5.h (the rlbotv5_* methods) against the RLBot v5 packet logged for the tick, bit for bit.
           RLBot keeps its jump flags and dodge timers itself, and a restored state does not hold them: those fields
-          are scored once the car has been at rest on the ground in the segment (no jump flag set).
+          are scored once the car has been at rest on the ground in the segment (no jump or dodge flag or timer set
+          in the packet or the car).
 """
 import argparse
 import json
@@ -176,7 +177,8 @@ def tick(rp, t, a, i, k, cars, cols, arena, mut, grounded, boost, where0, mid_fr
                 same = o == F32(p[12])
                 all_same = all_same and same
                 t.add(("rlbot", "boost"), same, where + [float(o), float(p[12])])
-            if int(p[13]) == 0 and p[17] < 0 and s.is_on_ground and not s.is_jumping and not s.has_jumped:
+            if not np.any(p[13:17]) and p[17] < 0 and p[18] == 0 and s.is_on_ground and not s.is_jumping and \
+                    not s.has_jumped and not s.has_double_jumped and not s.has_flipped:
                 grounded[j] = True
             if grounded[j]:
                 ours = (int(s.air_state), int(s.rlbotv5_has_jumped()), int(s.rlbotv5_has_double_jumped()),
