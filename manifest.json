@@ -142,5 +142,8 @@
   {"name": "u13_3v5_mix", "split": "uneven"},
   {"name": "u14_1v6_kira_mix", "split": "uneven"},
   {"name": "t_pads_a", "split": "pads"},
-  {"name": "t_pads_b", "split": "pads"}
+  {"name": "t_pads_b", "split": "pads"},
+  {"name": "ts1_3v3_a", "split": "tick1"},
+  {"name": "ts1_3v3_b", "split": "tick1"},
+  {"name": "ts1_3v3_c", "split": "tick1"}
 ]}

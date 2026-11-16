@@ -13,6 +13,7 @@ import multiprocessing as mp
 import os
 import struct
 import subprocess
+import threading
 import time
 
 import numpy as np
@@ -22,6 +23,21 @@ import score as sc
 CAR_F = 2 + 59        # preset, team, then fs_v3's CAR_F state floats
 DEMOED = 2 + 52       # is_demoed in a car's row
 F32 = np.float32
+
+
+def exchange(w, msg, nbytes):
+    """Send one segment and read its reply. The worker answers tick by tick, so a long segment's reply fills the
+    pipe before all of it is sent: the send runs beside the read."""
+    data = struct.pack("<%dd" % len(msg), *map(float, msg))
+
+    def send():
+        w.stdin.write(data)
+        w.stdin.flush()
+    t = threading.Thread(target=send)
+    t.start()
+    out = w.stdout.read(nbytes)
+    t.join()
+    return out
 
 
 def run(args):
@@ -53,11 +69,9 @@ def run(args):
             for j in range(ncars):
                 ticks += list(ctl[i, j]) + [bool(drv[i, j]), gain[j]]
             rows.append(None if seg["spawn"] and k == 0 or held[i] else i)
-        msg = [ncars, seg["ticks"]] + start + ticks
-        w.stdin.write(struct.pack("<%dd" % len(msg), *map(float, msg)))
-        w.stdin.flush()
         nb = ncars + 1
-        out = np.frombuffer(w.stdout.read(4 * 18 * nb * len(rows)), F32).reshape(len(rows), nb, 18)
+        out = np.frombuffer(exchange(w, [ncars, seg["ticks"]] + start + ticks, 4 * 18 * nb * len(rows)),
+                            F32).reshape(len(rows), nb, 18)
         seg_exact, scored = True, False
         for k, i in enumerate(rows):
             if i is None:
@@ -86,11 +100,9 @@ def run(args):
 
 def segment(w, ncars, start, ticks, rows):
     """One segment through the worker: the bodies after each tick, as score.py reads them."""
-    msg = [ncars, len(rows)] + start + ticks
-    w.stdin.write(struct.pack("<%dd" % len(msg), *map(float, msg)))
-    w.stdin.flush()
     nb = ncars + 1
-    out = np.frombuffer(w.stdout.read(4 * 18 * nb * len(rows)), F32).reshape(len(rows), nb, 18)
+    out = np.frombuffer(exchange(w, [ncars, len(rows)] + start + ticks, 4 * 18 * nb * len(rows)),
+                        F32).reshape(len(rows), nb, 18)
     return [[dict(pos=o[0:3] / F32(50), vel=o[3:6] / F32(50), vel_bt=o[3:6] / F32(50), ang=o[6:9], fwd=o[9:12],
                   right=o[12:15], up=o[15:18]) for o in out[k]] for k in range(len(rows))]
 
