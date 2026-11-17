@@ -21,7 +21,8 @@ Three more scripts check what RocketGPU reports and how it starts a round:
 
 ## Results
 
-The 144 recordings of data release v3: 13,930,650 body-ticks in 25,622 segments.
+The 144 recordings of data release v3: 13,930,650 body-ticks in 25,622 segments. RocketGPU 1.4.0 and 1.3.0 score
+the same.
 
 | | RocketGPU (CUDA) | RocketGPU (CPU) | RocketSim v3 0.3.6 |
 |---|---|---|---|
@@ -32,11 +33,21 @@ The 144 recordings of data release v3: 13,930,650 body-ticks in 25,622 segments.
 
 The three `tick1` recordings of v4 (a bot that acts on every tick): 967,122 body-ticks in 1,185 segments.
 
-| | RocketGPU 1.3.0 (CPU) | RocketSim v3 0.3.6 |
+| | RocketGPU 1.4.0 (CPU) | RocketGPU 1.3.0 (CPU) | RocketSim v3 0.3.6 |
+|---|---|---|---|
+| Exact body-ticks | 100.0000% | 99.9592% | 1.1596% |
+| Exact segments | 100.000% | 99.494% | 0.000% |
+| Segment pass | 100.000% | 99.952% | 86.308% |
+
+Long runs (`score_long.py`): from every 10th segment's start state, the 128 recordings that are not controls-only
+are stepped on the recorded inputs with no state restored on the way. A run ends at a tick that is not recorded or
+on which all cars are held, or where a segment starts with a spawn. 2,804 runs, 23,793,198 body-ticks; the mean run
+is 1,745 ticks and the longest 28,604 (4 minutes).
+
+| | RocketGPU 1.4.0 (CPU) | RocketGPU 1.3.0 (CPU) |
 |---|---|---|
-| Exact body-ticks | 99.9592% | 1.1596% |
-| Exact segments | 99.494% | 0.000% |
-| Segment pass | 99.952% | 86.308% |
+| Exact runs | 2,804 of 2,804 | 2,804 of 2,804 |
+| Exact body-ticks | 100.0000% | 100.0000% |
 
 RocketGPU starts from the full state (bodies, broadphase, contact manifolds, timers). RocketSim v3
 starts from the public state (what its `CarState`, `BallState` and boost pad states hold).
@@ -126,6 +137,12 @@ python score.py data --jobs 4 --json rocketgpu.json
 `score_batch.py` takes the same arguments and writes the same JSON, stepping each recording's segments together.
 
 ```bash
+python score_long.py data --json long.json
+```
+
+`--every N` starts a run at every Nth segment (10 by default); `--max-ticks T` ends runs after T ticks.
+
+```bash
 python score_api.py data --json api.json
 ```
 
@@ -133,7 +150,7 @@ python score_api.py data --json api.json
 python score_kickoff.py data --json kickoff.json
 ```
 
-Both take `--splits` and `--jobs`, and need a RocketGPU build later than 1.3.0: `Car.get_native_state()` and the
+Both take `--splits` and `--jobs`, and need RocketGPU 1.4.0 or later: `Car.get_native_state()` and the
 `rlbotv5_*` methods for `score_api.py`, `Arena.reset_to_kickoff()` for `score_kickoff.py`. Each prints, per field
 or check, how many car-ticks or kickoffs equal the game's.
 
