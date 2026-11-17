@@ -137,6 +137,11 @@ Both take `--splits` and `--jobs`, and need a RocketGPU build later than 1.3.0: 
 `rlbotv5_*` methods for `score_api.py`, `Arena.reset_to_kickoff()` for `score_kickoff.py`. Each prints, per field
 or check, how many car-ticks or kickoffs equal the game's.
 
+`score_api.py` leaves one case out. When a boost pad comes back under two or more cars that can take boost, the game
+gives it to the car its collision octree lists first, an order of engine arrays the recordings do not hold. In the
+controls-only recordings the boost of those cars is not scored from that tick to the end of the segment, and the
+count is printed (224 car-ticks: one pad in `ts1_3v3_b`).
+
 `--splits dev,test` scores some splits. `--shard I/N` scores every Nth recording (one process per
 GPU with `CUDA_VISIBLE_DEVICES`); `python score.py --merge all.json part*.json` adds the parts up.
 Needs Python 3.9+ and numpy.

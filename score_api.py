@@ -16,6 +16,10 @@ Replays the segments as score.py does and compares, per car and tick, with DATA_
           RLBot shows the boost of a pad that came back under a waiting car one tick late. A controls-only recording
           leaves the pads to the build, so the build decides which pickups those are. The other recordings give the
           game's own pad credits, and there the packet says whether a credit showed on its tick or the next.
+
+A pad that comes back under two or more cars that can take boost goes to the car the game's collision octree lists
+first: an order of engine arrays that no recorded state holds. In a controls-only recording the boost of those cars is
+not scored from that tick to the end of the segment (pad_ties); everything else of theirs still is.
 """
 import argparse
 import json
@@ -123,6 +127,50 @@ def boost_sets(arena, a, i, cols, credited=()):
     return out
 
 
+def box_overlap(pad, big, pos, rot, size, off):
+    """The pad's box (128 uu half-width, 160 for a big pad, 64 half-height) against the car's hitbox: the game's test
+    for the cars a returning pad touches. pos in uu, rot = the body's forward, right and up rows."""
+    h = np.array([160.0 if big else 128.0] * 2 + [64.0])
+    e = np.array(size, np.float64) * 0.5
+    ax = np.array(rot, np.float64).reshape(3, 3)
+    t = np.array(pos, np.float64) + off[0] * ax[0] + off[1] * ax[1] + off[2] * ax[2] - \
+        np.array([pad[0], pad[1], pad[2] - (1.0 if big else 5.917984)])
+    ar = np.abs(ax) + 1e-6
+    if np.any(np.abs(t) > h + e @ ar) or np.any(np.abs(ax @ t) > ar @ h + e):
+        return False
+    for i in range(3):
+        i1, i2 = (i + 1) % 3, (i + 2) % 3
+        for j in range(3):
+            j1, j2 = (j + 1) % 3, (j + 2) % 3
+            if abs(t[i2] * ax[j][i1] - t[i1] * ax[j][i2]) > \
+                    h[i1] * ar[j][i2] + h[i2] * ar[j][i1] + e[j1] * ar[j2][i] + e[j2] * ar[j1][i]:
+                return False
+    return True
+
+
+def pad_ties(z, a, at, seg, pads, boxes):
+    """{tick: data columns of the cars} where a pad came back under two or more cars that could take boost, read from
+    the game's data alone: a car's boost rose on a tick that left the pad taken as it was before, and another car
+    below full boost had its hitbox in that pad's box too. pads: (x, y, z, big) per pad column of "pads" (the
+    arena's get_boost_pads() order); boxes: per car column its hitbox (size, offset)."""
+    e, ok, taken, truth = a["game_e_boost"], a["game_ok"].astype(bool), z["pads"], z["truth"]
+    out = {}
+    for k in range(1, seg["ticks"]):
+        i, ip = at[seg["start"] + k], at[seg["start"] + k - 1]
+        both = ok[i] & ok[ip]
+        for c in np.nonzero(both & (e[i] > e[ip] + 0.0005))[0]:
+            def on(car, p):
+                return box_overlap(pads[p][:3], pads[p][3], truth[i, car, 0:3] * 50.0, truth[i, car, 9:18], *boxes[car])
+            for p in np.nonzero(taken[i] & taken[ip])[0]:
+                if np.hypot(pads[p][0] - truth[i, c, 0] * 50.0, pads[p][1] - truth[i, c, 1] * 50.0) < 400.0 and on(c, p):
+                    others = [int(o) for o in np.nonzero(both & (e[ip] < 1.0))[0] if o != c and
+                              np.hypot(pads[p][0] - truth[i, o, 0] * 50.0, pads[p][1] - truth[i, o, 1] * 50.0) < 400.0 and
+                              on(o, p)]
+                    if others:
+                        out.setdefault(k, set()).update([int(c)] + others)
+    return out
+
+
 class Tally:
     def __init__(self):
         self.n, self.same, self.first = Counter(), Counter(), {}
@@ -140,9 +188,10 @@ class Tally:
                     first={"/".join(k): v for k, v in self.first.items()}, cars=dict(self.cars))
 
 
-def tick(rp, t, a, i, k, cars, cols, arena, mut, grounded, boost, where0, mid_frame, sets=(), credited={}):
+def tick(rp, t, a, i, k, cars, cols, arena, mut, grounded, boost, where0, mid_frame, sets=(), credited={}, tied=()):
     """Tally one tick: arena car j is column cols[j] of the data. sets: cars whose boost the recording's script set
-    after this tick (boost_sets). credited: car -> its boost before the pad credit the recording gave it this tick."""
+    after this tick (boost_sets). credited: car -> its boost before the pad credit the recording gave it this tick.
+    tied: cars whose boost is not scored (pad_ties)."""
     ncars = len(cars)
     states = [c.get_native_state() for c in cars]
     for j, s in enumerate(states):
@@ -158,6 +207,9 @@ def tick(rp, t, a, i, k, cars, cols, arena, mut, grounded, boost, where0, mid_fr
                 ours, game = native_ours(s), native_truth(a, i, c)
                 all_same = True
                 for name, o, g in zip(NATIVE, ours, game):
+                    if name == "boost" and j in tied:
+                        t.cars["native/boost after a pad came back under two cars, not scored"] += 1
+                        continue
                     same = o == g or (name == "boost" and j in sets)
                     all_same = all_same and same
                     t.add(("native", name), same, where + [repr(o), repr(g)])
@@ -174,7 +226,9 @@ def tick(rp, t, a, i, k, cars, cols, arena, mut, grounded, boost, where0, mid_fr
             same = int(s.rlbotv5_is_supersonic(mut)) == int(p[20])
             all_same = all_same and same
             t.add(("rlbot", "is_supersonic"), same, where)
-            if j in sets or (boost[j] is None and j in credited):
+            if j in tied:
+                t.cars["rlbot/boost after a pad came back under two cars, not scored"] += 1
+            elif j in sets or (boost[j] is None and j in credited):
                 pass   # this packet can be from before the script's set or the pad's credit: the count starts on the next
             elif boost[j] is None:   # RLBot counts boost itself: its count starts from the packet
                 boost[j] = rp.RlbotV5Boost()
@@ -256,6 +310,13 @@ def run(path):
         mut = arena.get_mutator_config()
         cols = list(seg["perm"]) if co else list(range(ncars))
         grounded, boost = [False] * ncars, [None] * ncars
+        ties, tied = {}, set()
+        if co and ncars > 1:
+            pads = [(*(lambda q: (q.x, q.y, q.z))(p.get_pos()), bool(p.is_big)) for p in arena.get_boost_pads()]
+            cfgs = [call[1][1] for call in meta["cars"][seg["cars"]] if call[0] == "add_car"]
+            boxes = {cols[j]: tuple([cfgs[j][f][x] for x in "xyz"] for f in ("hitbox_size", "hitbox_offset"))
+                     for j in range(ncars)}
+            ties = pad_ties(z, a, at, seg, pads, boxes)
         for k in range(seg["ticks"]):
             i = at[seg["start"] + k]
             for j, c in enumerate(cars):
@@ -276,8 +337,9 @@ def run(path):
             if seg["spawn"] and k == 0 or z["held"][i]:
                 boost = [None] * ncars
                 continue
+            tied |= {cols.index(c) for c in ties.get(k, ())}
             tick(rp, t, a, i, k, cars, cols, arena, mut, grounded, boost, [meta["name"], seg["start"]],
-                 not co and z["frac"][i] < 0, sets, credited)
+                 not co and z["frac"][i] < 0, sets, credited, tied)
     return t.result(meta["name"])
 
 
