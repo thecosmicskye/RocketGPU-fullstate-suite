@@ -49,8 +49,9 @@ with `set_full_state` in
 [RocketGPU 15484501](https://github.com/thecosmicskye/RocketGPU/commit/15484501768d0a537eed853e3287f0d93ea1b417)
 or later builds with the same fields.
 
-The recordings are two release assets (878 MB and 827 MB; v4 adds the `tick1` recordings and every recording's
-`.api.npz`):
+The recordings are three release assets (878 MB, 827 MB and 55 MB; v4 adds the `tick1` recordings and every
+recording's `.api.npz`; v5 replaces nine `.api.npz` files, whose RLBot packets are matched to the game's ticks again:
+a packet could land one tick off while the cars were almost at rest):
 
 ```bash
 gh release download v3 -R thecosmicskye/RocketGPU-fullstate-suite
@@ -61,7 +62,11 @@ gh release download v4 -R thecosmicskye/RocketGPU-fullstate-suite
 ```
 
 ```bash
-tar xf fullstate-suite-v3.tar && tar xf fullstate-suite-v4.tar && sha256sum -c data.sha256
+gh release download v5 -R thecosmicskye/RocketGPU-fullstate-suite
+```
+
+```bash
+tar xf fullstate-suite-v3.tar && tar xf fullstate-suite-v4.tar && tar xf fullstate-suite-v5.tar && sha256sum -c data.sha256
 ```
 
 `data/NAME.npz` holds, per recording:
