@@ -15,7 +15,7 @@ Three more scripts check what RocketGPU reports and how it starts a round:
 
 - `score_api.py`: a car's state after every tick. `native` is `Car.get_native_state()` against the game's own
   memory; `rlbot` is the `rlbotv5_*` methods against the RLBot v5 packet of the tick.
-- `score_v3_api.py`: `Car.get_state_v3()` against RocketSim v3, one tick at a time from the same state.
+- `score_v3_api.py`: `Car.get_state_v3()` against RocketSim v3 stepping the same ticks on the same controls.
 - `score_kickoff.py`: every kickoff. The spot each car gets, with and without the countdown; every body through
   the countdown; the tick the cars are let go.
 
@@ -187,9 +187,12 @@ errors in the fourth decimal.
 python score_v3_api.py data v3/target/release/fs_v3 --json v3_api.json
 ```
 
-`score_v3_api.py` replays the segments in RocketGPU. Before every tick it sets RocketSim v3 to RocketGPU's
-`get_state_v3()` values, steps v3 once on the same controls and compares every `CarState` field with RocketGPU's
-after its own tick. It checks the values the v3 state reports, not the physics: the bodies are not scored.
+`score_v3_api.py` replays the segments in RocketGPU with RocketSim v3 stepping the same ticks on the same controls.
+v3 keeps its own jump, dodge, boost, handbrake and supersonic flags and timers. Before every tick only what the
+physics decides (each car's body, boost, bump cooldown, last ball hit and demolition, the ball, the boost pads) is set
+to RocketGPU's values, and after it every `CarState` field is compared with `get_state_v3()`. It checks the values
+the v3 state reports, not the physics: the bodies are not scored. Car-ticks where v3 jumps or dodges and the game's
+car does not, or the reverse, are counted apart, and v3 goes on from RocketGPU's state.
 
 ## License
 

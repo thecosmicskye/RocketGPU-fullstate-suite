@@ -1,24 +1,33 @@
-"""Check RocketGPU's v3 layer (Car.get_state_v3) against RocketSim v3, one tick at a time, on the full-state suite.
+"""Check RocketGPU's v3 layer (Car.get_state_v3) against RocketSim v3 running alongside it on the full-state suite.
 
     python score_v3_api.py DATA_DIR WORKER [--names a,b,...] [--splits dev,test,...] [--jobs N] [--json OUT]
 
 WORKER is the v3/ build (target/release/fs_v3). Needs what score.py needs (PYTHONPATH with the build's python dir,
 ROCKETGPU_COLLISION_MESH_DIR) and score.py's folder on PYTHONPATH when this file is not next to it.
 
-Each segment is replayed in RocketGPU as score.py does. For every tick:
-  prev  every car's get_state_v3(), the ball and the boost pads before the tick
-  cur   every car's get_state_v3() after RocketGPU's step (before score.py's boost pad credits)
-  ref   RocketSim v3 set to prev (each car's full CarState, the ball, the pads), given the same controls and stepped
-        one tick: every car's CarState after it
-and cur is compared with ref field by field. Bodies are not scored: the two simulators' physics differ. Each field is
-counted over all compared car-ticks and over those where v3's is_on_ground and wheels_with_contact after the tick
-equal RocketGPU's ("contacts agree").
+Each segment is replayed in RocketGPU as score.py does, with RocketSim v3 stepping the same ticks on the same
+controls. A v3 car keeps its own CarState from tick to tick: the jump, dodge, boost, handbrake and supersonic flags and
+timers are v3's. Before every tick only what the physics decides is set to RocketGPU's values: each car's body, boost,
+bump cooldown, last ball hit and demolition, the ball and the boost pads. After the tick every car's get_state_v3()
+(read before score.py's boost pad credits) is compared with v3's CarState field by field. Bodies are not scored: the
+two simulators' physics differ.
+
+A v3 car is set to RocketGPU's whole CarState ("seeded") instead:
+  - on a segment's first tick and on the tick after a spawn segment's first;
+  - on the tick after it was demolished or respawned;
+  - while RocketGPU holds the car (countdown, goal replay) and on its first tick after: v3 has no driving-disabled
+    state, so a held car gets no input in v3 and is not compared;
+  - when its has_jumped, has_double_jumped, has_flipped, is_flipping or is_jumping came out of the last tick
+    different from RocketGPU's: v3 jumped or dodged where the game's car did not, or the reverse. Those car-ticks are
+    counted ("acted differently") and v3 goes on from RocketGPU's state.
+
+Each field is counted over all compared car-ticks and over those where v3 did the same as RocketGPU's car: those five
+flags, is_on_ground and wheels_with_contact after the tick are equal ("same actions").
 
 What v3 gets and how values are mapped:
   - The v3 arena is kept for a segment. State v3 has no setter for (wheel suspension history, the world contact
     normal, pad membership, who demolished whom) is v3's own from its previous tick; the wheel contact gate is
     refreshed at the set pose (Arena::refresh_car_sticky_gate).
-  - v3 has no driving-disabled state: a car RocketGPU holds (countdown, goal replay) gets the same controls in v3.
   - bump_cooldown_victim is a car id in RocketGPU and an arena index in v3: ids are mapped to indices.
   - last_extra_hit_tick counts each arena's own ticks (RocketGPU's is the full state's env_states.tick, which a
     restored segment starts at the game's tick; Arena.get_tick_count() restarts at 0): values are shifted by the
@@ -27,12 +36,11 @@ What v3 gets and how values are mapped:
   - A pad RocketGPU has off is given its cooldown (at least one tick).
 
 Rules for what is counted (each with its count in the output):
-  - not compared: the ticks score.py does not score (a spawn segment's first tick, held ticks).
+  - not compared: the ticks score.py does not score (a spawn segment's first tick, held ticks) and held cars.
   - world_contact_normal is compared on car-ticks where both sides have one; has_world_contact covers the rest.
   - floats are equal when ==; "within 1e-5" is absolute.
-Every mismatch among the contacts-agree car-ticks is put in one class: "demo" (the car is demolished before or after
-the tick on either side), else "pad" (v3 or RocketGPU gave the car pad boost this tick), else "held" (driving
-disabled), else "other".
+Every mismatch among the same-actions car-ticks is put in one class: "demo" (the car is demolished before or after
+the tick on either side), else "pad" (v3 or RocketGPU gave the car pad boost this tick), else "other".
 """
 import argparse
 import collections
@@ -50,7 +58,8 @@ PUB_F = 2 + 59        # a car's row in the data's "public": preset, team, then t
 WARM = 2              # ticks the worker steps a new arena before the segment
 NEAR = 1e-5
 F32 = np.float32
-CLASSES = ("demo", "pad", "held", "other")
+CLASSES = ("demo", "pad", "other")
+ACT = ("has_jumped", "has_double_jumped", "has_flipped", "is_flipping", "is_jumping")
 
 # Columns of a car's row, RocketGPU's and the worker's alike: 18 body values, then the fields.
 BODY = dict(pos=(0, 3), vel=(3, 6), ang_vel=(6, 9), rot_mat=(9, 18))
@@ -145,20 +154,25 @@ def replay(rp, rs, z, meta, n, at, credits):
     return out
 
 
-def v3_step(w, run, presets):
-    """Every tick of a replayed segment through the worker: v3's rows after each one-tick step from prev."""
+def v3_step(w, seg, run, presets):
+    """Every tick of a replayed segment through the worker: v3's rows after each tick."""
     T, ncars = run["prev"].shape[:2]
-    prev = run["prev"]
+    prev, drv = run["prev"], run["driving"]
+    seed = np.zeros((T, ncars), bool)       # the worker seeds every car on the first tick by itself
+    seed[1:] = ~drv[1:] | ~drv[:-1] | ((prev[1:, :, COL["is_demoed"]] != 0) != (prev[:-1, :, COL["is_demoed"]] != 0))
+    if seg["spawn"]:
+        seed[1:2] = True
     D = run["tick"] - (WARM + np.arange(T))          # RocketGPU's tick count minus v3's
     hit = prev[:, :, COL["last_extra_hit_tick"]]
     sent_hit = np.where(hit < 0, -1.0, np.maximum(hit - D[:, None], 0.0))
     state = prev[:, :, 18:51].copy()
     state[:, :, COL["last_extra_hit_tick"] - 18] = sent_hit
     state[:, :, COL["bump_cooldown_victim"] - 18] = np.maximum(state[:, :, COL["bump_cooldown_victim"] - 18], -1.0)
-    # the worker's car row: pos, forward, right, up, vel, ang vel, this tick's controls, the state, then the
-    # previous controls
-    cars = np.concatenate([prev[:, :, 0:3], prev[:, :, 9:18], prev[:, :, 3:9], run["ctl"], state,
-                           prev[:, :, COL["prev_controls"]:NCOL]], axis=2)
+    # the worker's car row: pos, forward, right, up, vel, ang vel, this tick's controls (none for a held car), the
+    # state, the previous controls, then whether to seed
+    ctl = np.where(drv[:, :, None], run["ctl"], 0.0)
+    cars = np.concatenate([prev[:, :, 0:3], prev[:, :, 9:18], prev[:, :, 3:9], ctl, state,
+                           prev[:, :, COL["prev_controls"]:NCOL], seed[:, :, None]], axis=2)
     head = [-2.0, ncars, T]
     for j in range(ncars):
         head += [presets[j], run["teams"][j]]
@@ -183,7 +197,8 @@ def fmt_val(x, is_float):
 
 
 def new_result(name):
-    return dict(name=name, segments=0, car_ticks=0, agree=0, not_compared=0, classes=dict.fromkeys(CLASSES, 0),
+    return dict(name=name, segments=0, car_ticks=0, agree=0, acted=0, acted_events=0, not_compared=0,
+                classes=dict.fromkeys(CLASSES, 0),
                 classes_agree=dict.fromkeys(CLASSES, 0), unknown_victim_id=0, v3_pickups=0, our_boost_gains=0,
                 fields={f[0]: dict(all=[0, 0, 0], agree=[0, 0, 0], cls={}) for f in FIELDS},
                 bodies={b: [0, 0] for b in BODY})
@@ -192,7 +207,7 @@ def new_result(name):
 def tally(r, seg, run, ref, ref_hit):
     """Add one segment's comparison to the recording's result."""
     prev, cur = run["prev"].astype(F32), run["cur"].astype(F32)
-    scored = np.broadcast_to(run["scored"][:, None], cur.shape[:2])
+    scored = run["scored"][:, None] & run["driving"]
     r["segments"] += 1
     r["not_compared"] += int((~scored).sum())
     r["car_ticks"] += int(scored.sum())
@@ -205,10 +220,14 @@ def tally(r, seg, run, ref, ref_hit):
     our_gain = (cur[:, :, COL["boost"]] > prev[:, :, COL["boost"]]) & (cur[:, :, dem] == prev[:, :, dem])
     r["v3_pickups"] += int((v3_pick & scored).sum())
     r["our_boost_gains"] += int((our_gain & scored).sum())
-    cls = np.where(demo, 0, np.where(v3_pick | our_gain, 1, np.where(~run["driving"], 2, 3)))
+    cls = np.where(demo, 0, np.where(v3_pick | our_gain, 1, 2))
     g, w = COL["is_on_ground"], COL["wheels_with_contact"]
-    agree = scored & (cur[:, :, g] == ref[:, :, g]) & (cur[:, :, w:w + 4] == ref[:, :, w:w + 4]).all(axis=2)
+    same = np.all([cur[:, :, COL[a]] == ref[:, :, COL[a]] for a in ACT], axis=0)
+    agree = scored & same & (cur[:, :, g] == ref[:, :, g]) & (cur[:, :, w:w + 4] == ref[:, :, w:w + 4]).all(axis=2)
     r["agree"] += int(agree.sum())
+    acted = scored & ~same
+    r["acted"] += int(acted.sum())
+    r["acted_events"] += int(acted[0].sum() + (acted[1:] & same[:-1]).sum())
     for c, name in enumerate(CLASSES):
         r["classes"][name] += int((scored & (cls == c)).sum())
         r["classes_agree"][name] += int((agree & (cls == c)).sum())
@@ -269,7 +288,7 @@ def run(args):
         teams = [int(pub[j * PUB_F + 1]) for j in range(meta["ncars"])]
         if teams != rep["teams"]:
             raise RuntimeError(f"{meta['name']} segment {n}: teams {rep['teams']} != the public row's {teams}")
-        ref, ref_hit = v3_step(w, rep, [pub[j * PUB_F] for j in range(meta["ncars"])])
+        ref, ref_hit = v3_step(w, seg, rep, [pub[j * PUB_F] for j in range(meta["ncars"])])
         tally(r, seg, rep, ref, ref_hit)
     w.stdin.write(np.array([-1.0], "<f8").tobytes())
     w.stdin.close()
@@ -280,7 +299,8 @@ def run(args):
 def merge(res):
     t = new_result("total")
     for r in res:
-        for k in ("segments", "car_ticks", "agree", "not_compared", "unknown_victim_id", "v3_pickups", "our_boost_gains"):
+        for k in ("segments", "car_ticks", "agree", "acted", "acted_events", "not_compared", "unknown_victim_id",
+                  "v3_pickups", "our_boost_gains"):
             t[k] += r[k]
         for k in ("classes", "classes_agree"):
             for c in CLASSES:
@@ -307,12 +327,13 @@ def report(r, details):
         return f"{eq:>10} / {n:<10} {pct}"
 
     print(f"== {r['name']}: {r['segments']} segments, {r['car_ticks']} car-ticks compared "
-          f"({r['not_compared']} not compared: ticks score.py does not score), contacts agree on {r['agree']}")
-    print("   car-ticks by class, all / contacts agree: " +
+          f"({r['not_compared']} not compared: ticks score.py does not score, held cars), same actions on "
+          f"{r['agree']}, v3 acted differently on {r['acted']} in {r['acted_events']} events")
+    print("   car-ticks by class, all / same actions: " +
           ", ".join(f"{c} {r['classes'][c]} / {r['classes_agree'][c]}" for c in CLASSES) +
           f"; v3 pad pickups {r['v3_pickups']}, RocketGPU boost gains in the step {r['our_boost_gains']}, "
           f"victim ids not in the arena {r['unknown_victim_id']}")
-    print(f"   {'field':<24}{'all: equal / compared':^36}{'within 1e-5':>12}   {'contacts agree: equal / compared':^36}"
+    print(f"   {'field':<24}{'all: equal / compared':^36}{'within 1e-5':>12}   {'same actions: equal / compared':^36}"
           f"{'within 1e-5':>12}")
     for name, _, _, is_float in FIELDS:
         f = r["fields"][name]
@@ -321,7 +342,7 @@ def report(r, details):
     print("   bodies equal (not scored): " + ", ".join(f"{b} {e} / {n}" for b, (e, n) in r["bodies"].items()))
     if not details:
         return
-    print("   mismatches among contacts-agree car-ticks, by class: count, commonest RocketGPU vs v3 values, first "
+    print("   mismatches among same-actions car-ticks, by class: count, commonest RocketGPU vs v3 values, first "
           "places (recording, segment start frame, tick, car slot)")
     for name, _, _, _ in FIELDS:
         f = r["fields"][name]

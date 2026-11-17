@@ -3,12 +3,15 @@
 //! n_pads and per pad [x, y, cooldown]; then per tick, per car [8 controls, driving, credit gain]. Reply: per tick,
 //! per car then the ball, pos (uu), vel (uu/s), ang vel, forward, right, up (18 f32). n_cars = -1 ends.
 //!
-//! One-tick mode (score_v3_api.py), a segment starting with -2: n_cars, n_ticks, per car [preset, team], n_pads and
+//! State mode (score_v3_api.py), a segment starting with -2: n_cars, n_ticks, per car [preset, team], n_pads and
 //! per pad [x, y]. The arena is kept for the segment and stepped API_WARM ticks first. Then per tick: per car [CAR_F
-//! state floats (their controls are this tick's), 8 previous controls], the ball [18 + asleep], and each
-//! pad's cooldown. Every tick sets all of that, steps once and replies per car API_OUT f32: the 18 body values, the
-//! state floats from has_jumped on (33), world contact [has, normal], controls, previous controls, and the pad the
-//! car picked up this tick (-1 none); then the ball's 18.
+//! state floats (their controls are this tick's), 8 previous controls, seed], the ball [18 + asleep], and each
+//! pad's cooldown. A car keeps its own state from tick to tick: only its body, boost, bump cooldown, last ball hit
+//! and demolition are set from the sent floats, with the tick's controls. It is set to all of the sent state
+//! ("seeded") on the first tick, where seed is not 0, and where its jump and dodge flags differ from the sent ones
+//! (it did something else than the sender's car on the last tick). Every tick steps once and replies per car API_OUT
+//! f32: the 18 body values, the state floats from has_jumped on (33), world contact [has, normal], controls,
+//! previous controls, and the pad the car picked up this tick (-1 none); then the ball's 18.
 
 use std::io::{self, BufWriter, Read, Write};
 
@@ -115,6 +118,42 @@ fn seed(arena: &mut Arena, id: usize, a: &[f64; CAR_F], prev: Option<CarControls
     });
 }
 
+/// A car that keeps its own flags and timers: what the physics decides (body, boost, bump cooldown, last ball hit,
+/// demolition) is set from CAR_F floats, with this tick's controls.
+fn sync(arena: &mut Arena, id: usize, a: &[f64; CAR_F]) {
+    let bytes = a.map(f64::to_le_bytes).concat();
+    let mut r = In(&bytes[..]);
+    let pos = r.v();
+    let (fw, rt, up) = (r.v(), r.v(), r.v());
+    let (vel, ang) = (r.v(), r.v());
+    let controls = r.controls();
+    for _ in 0..13 {
+        r.f();
+    }
+    let boost = r.f() as f32;
+    for _ in 0..9 {
+        r.f();
+    }
+    let bump_cooldown_timer = r.f() as f32;
+    let victim = r.f();
+    let extra_hit = r.f();
+    let is_demoed = r.b();
+    let demo_respawn_timer = r.f() as f32;
+    arena.edit_car_state_full(id, |s| {
+        s.phys.pos = pos;
+        s.phys.rot_mat = Mat3A::from_cols(fw, rt, up);
+        s.phys.vel = vel;
+        s.phys.ang_vel = ang;
+        s.controls = controls;
+        s.boost = boost;
+        s.bump_cooldown_timer = bump_cooldown_timer;
+        s.bump_cooldown_victim = (victim >= 0.0).then(|| victim as usize);
+        s.last_extra_hit_tick = (extra_hit >= 0.0).then(|| extra_hit as u64);
+        s.is_demoed = is_demoed;
+        s.demo_respawn_timer = demo_respawn_timer;
+    });
+}
+
 const API_WARM: usize = 2;
 
 fn api<R: Read, W: Write>(inp: &mut In<R>, out: &mut W) {
@@ -146,7 +185,7 @@ fn api<R: Read, W: Write>(inp: &mut In<R>, out: &mut W) {
         arena.step_tick();
     }
     let mut pickup = vec![-1f32; n];
-    for _ in 0..ticks {
+    for t in 0..ticks {
         let mut next = Vec::with_capacity(n);
         for &id in &ids {
             let mut a = [0f64; CAR_F];
@@ -154,7 +193,17 @@ fn api<R: Read, W: Write>(inp: &mut In<R>, out: &mut W) {
                 *x = inp.f();
             }
             let prev = inp.controls();
-            seed(&mut arena, id, &a, Some(prev));
+            let seeded = inp.b();
+            let acted = {
+                let s = arena.get_car_state(id);
+                let b = |i: usize| a[i] != 0.0;
+                (s.has_jumped, s.has_double_jumped, s.has_flipped, s.is_flipping, s.is_jumping) != (b(26), b(27), b(28), b(34), b(35))
+            };
+            if t == 0 || seeded || acted {
+                seed(&mut arena, id, &a, Some(prev));
+            } else {
+                sync(&mut arena, id, &a);
+            }
             if !arena.get_car_state(id).is_demoed {
                 arena.refresh_car_sticky_gate(id);
             }
