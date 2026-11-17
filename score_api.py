@@ -11,7 +11,11 @@ Replays the segments as score.py does and compares, per car and tick, with DATA_
   rlbot   rocketgpu/rlbotv5.h (the rlbotv5_* methods) against the RLBot v5 packet logged for the tick, bit for bit.
           RLBot keeps its jump flags and dodge timers itself, and a restored state does not hold them: those fields
           are scored once the car has been at rest on the ground in the segment (no jump or dodge flag or timer set
-          in the packet or the car).
+          in the packet or the car), and again after any tick RLBot sent no packet for (one in the middle of a
+          render frame): its own clocks skip there. RLBot's boost count starts from the packet the same way.
+          RLBot shows the boost of a pad that came back under a waiting car one tick late. A controls-only recording
+          leaves the pads to the build, so the build decides which pickups those are. The other recordings give the
+          game's own pad credits, and there the packet says whether a credit showed on its tick or the next.
 """
 import argparse
 import json
@@ -101,12 +105,13 @@ def credit_boost(arena, credits):
     st.commit()
 
 
-def boost_sets(arena, a, i, cols):
+def boost_sets(arena, a, i, cols, credited=()):
     """A scripted recording sets boost between ticks. Where the game's amount moves between a tick's end and the next
-    tick's start on a tick with no pad pickup, the arena's car gets the game's amount; returns those cars."""
+    tick's start for a car with no pad credit on that tick, the arena's car gets the game's amount; returns those
+    cars."""
     st, out = None, []
     for j, c in enumerate(cols):
-        if a["game_ok"][i, c] and a["game_e_boost"][i, c] != a["game_x_boost"][i, c]:
+        if j not in credited and a["game_ok"][i, c] and a["game_e_boost"][i, c] != a["game_x_boost"][i, c]:
             st = st or sc.State(arena)
             g = F32(a["game_e_boost"][i, c])
             if "car_states.boost_amount" in st.st:
@@ -135,9 +140,9 @@ class Tally:
                     first={"/".join(k): v for k, v in self.first.items()}, cars=dict(self.cars))
 
 
-def tick(rp, t, a, i, k, cars, cols, arena, mut, grounded, boost, where0, mid_frame, sets=()):
+def tick(rp, t, a, i, k, cars, cols, arena, mut, grounded, boost, where0, mid_frame, sets=(), credited={}):
     """Tally one tick: arena car j is column cols[j] of the data. sets: cars whose boost the recording's script set
-    after this tick (boost_sets)."""
+    after this tick (boost_sets). credited: car -> its boost before the pad credit the recording gave it this tick."""
     ncars = len(cars)
     states = [c.get_native_state() for c in cars]
     for j, s in enumerate(states):
@@ -169,17 +174,41 @@ def tick(rp, t, a, i, k, cars, cols, arena, mut, grounded, boost, where0, mid_fr
             same = int(s.rlbotv5_is_supersonic(mut)) == int(p[20])
             all_same = all_same and same
             t.add(("rlbot", "is_supersonic"), same, where)
-            if boost[j] is None:   # RLBot counts boost itself: its count starts from the packet
+            if j in sets or (boost[j] is None and j in credited):
+                pass   # this packet can be from before the script's set or the pad's credit: the count starts on the next
+            elif boost[j] is None:   # RLBot counts boost itself: its count starts from the packet
                 boost[j] = rp.RlbotV5Boost()
                 boost[j].boost, boost[j].whole = float(p[12]), int(np.ceil(s.boost))
             else:
-                o = F32(boost[j].update(s))
+                o = None
+                if j in credited and hasattr(s, "rlbotv5_boost_hold"):
+                    # RLBot shows the boost of a pad that came back under the car a tick late. A controls-only
+                    # recording leaves the pads to the build; here the recording gives the credit, so which of the
+                    # two it was is read from the packet.
+                    now, late = rp.RlbotV5Boost(), rp.RlbotV5Boost()
+                    now.boost, now.whole = late.boost, late.whole = boost[j].boost, boost[j].whole
+                    if F32(now.update(s)) != F32(p[12]):
+                        s.rlbotv5_boost_hold = int(np.ceil(credited[j])) + 1
+                        o = F32(late.update(s))
+                        s.rlbotv5_boost_hold = 0
+                        if o == F32(p[12]):
+                            boost[j] = late
+                            t.cars["rlbot/pad credits shown a tick later (read from the packet)"] += 1
+                        else:
+                            o = None
+                if o is None:
+                    o = F32(boost[j].update(s))
                 same = o == F32(p[12])
                 all_same = all_same and same
                 t.add(("rlbot", "boost"), same, where + [float(o), float(p[12])])
-            if not np.any(p[13:17]) and p[17] < 0 and p[18] == 0 and s.is_on_ground and not s.is_jumping and \
-                    not s.has_jumped and not s.has_double_jumped and not s.has_flipped:
+            if not grounded[j] and not np.any(p[13:17]) and p[17] < 0 and p[18] == 0 and s.is_on_ground and \
+                    not s.is_jumping and not s.has_jumped and not s.has_double_jumped and not s.has_flipped:
                 grounded[j] = True
+                if s.rlbotv5_has_jumped():   # RLBot's own has_jumped is not in the recorded state: it starts here
+                    st = sc.State(arena)
+                    st.put("car_states.game_has_jumped", j, "<B", 0)
+                    st.commit()
+                    s = cars[j].get_native_state()
             if grounded[j]:
                 ours = (int(s.air_state), int(s.rlbotv5_has_jumped()), int(s.rlbotv5_has_double_jumped()),
                         int(s.rlbotv5_has_dodged()), F32(s.rlbotv5_dodge_timeout()), F32(s.rlbotv5_dodge_elapsed()))
@@ -193,7 +222,10 @@ def tick(rp, t, a, i, k, cars, cols, arena, mut, grounded, boost, where0, mid_fr
             t.cars["rlbot/car-ticks"] += 1
             t.cars["rlbot/exact"] += int(all_same)
         else:
+            # RLBot sent nothing for the car on this tick (a tick in the middle of a render frame, a demolished car):
+            # the values it counts itself restart
             boost[j] = None
+            grounded[j] = False
     if a["rlbot_ok"][i] and not np.isnan(a["rlbot_ball"][i, 0]):
         b = a["rlbot_ball"][i]
         ours = phys_rows(arena.ball.get_native_state().rlbotv5_physics(mut))
@@ -234,16 +266,18 @@ def run(path):
                 sc.set_frame(arena, None if np.isnan(z["frac"][i]) else float(z["frac"][i]),
                              float(z["start_dt"][i]) if k else -1.0)
             arena.step(1)
-            sets = ()
+            sets, credited = (), {}
             if i in credits:
+                before = [float(c.get_native_state().boost) for c in cars]
                 credit_boost(arena, credits[i])
-            elif not co and not z["frac"][i] < 0:
-                sets = boost_sets(arena, a, i, cols)
+                credited = {j: b for j, (b, c) in enumerate(zip(before, cars)) if c.get_native_state().boost != b}
+            if not co and not z["frac"][i] < 0:
+                sets = boost_sets(arena, a, i, cols, credited)
             if seg["spawn"] and k == 0 or z["held"][i]:
                 boost = [None] * ncars
                 continue
             tick(rp, t, a, i, k, cars, cols, arena, mut, grounded, boost, [meta["name"], seg["start"]],
-                 not co and z["frac"][i] < 0, sets)
+                 not co and z["frac"][i] < 0, sets, credited)
     return t.result(meta["name"])
 
 
@@ -267,7 +301,7 @@ def report(res):
                       (f"   {miss} differ, first (recording, start, tick, car, ours, game): {tot.first.get(k, [])[:2]}"
                        if miss else ""))
         for k in sorted(tot.cars):
-            if k.startswith(layer + "/") and "scored" in k:
+            if k.startswith(layer + "/") and k.split("/", 1)[1] not in ("car-ticks", "exact"):
                 print(f"  {k.split('/', 1)[1]}: {tot.cars[k]}")
     return dict(n=dict(tot.n), same=dict(tot.same), cars=dict(tot.cars), first=tot.first)
 
